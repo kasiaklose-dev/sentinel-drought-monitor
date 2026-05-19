@@ -5,9 +5,10 @@ import streamlit as st
 import pydeck as pdk
 from sqlalchemy import create_engine
 
-st.set_page_config(page_title="Teledetekcja: Monitor Stresu", layout="wide")
+# Ustawienia strony dla szybszego renderowania
+st.set_page_config(page_title="Monitor Stresu", layout="wide")
 
-# Konfiguracja połączenia z obsługą SSL
+# Konfiguracja bazy
 if "postgres" in st.secrets:
     db = st.secrets["postgres"]
     DB_URL = f"postgresql://{db['user']}:{db['password']}@{db['host']}:{db['port']}/{db['database']}?sslmode=require"
@@ -16,13 +17,14 @@ else:
 
 @st.cache_resource
 def get_engine():
+    # Używamy puli połączeń dla wydajności
     return create_engine(DB_URL, pool_size=5, max_overflow=10)
 
-# OPTYMALIZACJA: Agregacja w bazie danych (zamiast pobierać miliony punktów)
-@st.cache_data(ttl=600) # Cache danych na 10 minut
+# OPTYMALIZACJA: Agregacja w bazie i cache na 1 godzinę
+@st.cache_data(ttl=3600)
 def load_data(threshold):
     engine = get_engine()
-    # Pobieramy tylko to, co potrzebne, filtrując już w SQL
+    # POBIERAMY TYLKO KOLUMNY KTÓRE SĄ POTRZEBNE
     query = f"""
         SELECT 
             ST_Y(ST_Transform(geometry, 4326)) as lat, 
@@ -31,35 +33,47 @@ def load_data(threshold):
         FROM predictions_drought 
         WHERE drought_probability_pct >= {threshold} 
         AND predicted_drought_risk = 1
-        LIMIT 50000; -- Bezpieczny limit dla płynności PyDeck
+        LIMIT 30000;
     """
     return pd.read_sql(query, engine)
 
 def main():
     st.title("🛰️ System Monitorowania Stresu Wodnego")
     
-    threshold = st.sidebar.slider("Minimalne prawdopodobieństwo stresu (%)", 0.0, 100.0, 50.0)
+    # Suwak nie powinien triggerować przeładowania całej aplikacji jeśli to możliwe
+    threshold = st.sidebar.slider("Prawdopodobieństwo stresu (%)", 0.0, 100.0, 50.0)
     
-    # Dane ładują się tylko przy zmianie suwaka
+    # Ładowanie danych
     df = load_data(threshold)
     
-    # Mapa z wyłączonym "pickable" dla wydajności przy dużej ilości punktów
+    if df.empty:
+        st.warning("Brak danych dla wybranego progu.")
+        return
+
+    # Szybka mapa - wyłączamy extruded i pickable dla maksymalnej płynności
     layer = pdk.Layer(
         "HexagonLayer",
         df,
         get_position=["lon", "lat"],
-        radius=150,
+        radius=200,
         elevation_scale=0,
-        pickable=False, # Wyłączenie interakcji wewnątrz mapy drastycznie przyspiesza renderowanie
-        color_range=[[255, 237, 160], [240, 59, 32], [189, 0, 38]],
+        pickable=False, 
+        extruded=False,
+        color_range=[[255, 237, 160], [254, 217, 118], [240, 59, 32], [189, 0, 38]],
         get_color_weight="stress",
     )
 
+    # Używamy statycznego widoku by nie obliczać go za każdym razem
+    center_lat = df.lat.mean()
+    center_lon = df.lon.mean()
+
     st.pydeck_chart(pdk.Deck(
         layers=[layer],
-        initial_view_state=pdk.ViewState(latitude=df.lat.mean() if not df.empty else 52.0, longitude=df.lon.mean() if not df.empty else 19.0, zoom=10),
-        map_style="mapbox://styles/mapbox/light-v10" # Szybsze mapy niż CartoDB
-    ))
+        initial_view_state=pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=10),
+        map_style="mapbox://styles/mapbox/light-v9"
+    ), use_container_width=True)
+
+    st.caption(f"Wyświetlono {len(df)} rekordów.")
 
 if __name__ == "__main__":
     main()
